@@ -1,0 +1,579 @@
+---
+title: "Kaggle Titanic Project"
+author: "Janice Jiang"
+date: "2024-05-07"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Data preparation and package loading
+
+<br>
+
+```{r, message = False}
+library(tidymodels)
+library(readr)
+library(tidyverse)
+library(themis)
+library(naniar)
+library(ggthemes)
+library(ggplot2)
+library(corrplot)
+library(conflicted)
+
+tidymodels_prefer()
+
+set.seed(20392)
+```
+
+```{r}
+titanic = read_csv("titanic.csv", show_col_types = F)
+
+titanic$survived = as.factor(titanic$survived)
+titanic$pclass = as.factor(titanic$pclass)
+
+head(titanic)
+```
+
+<br>
+
+#### dataset codebook
+
+-   `survival`: Survival
+
+-   `pclass`: Ticket class 1 = 1st, 2 = 2nd, 3 = 3rd
+
+-   `sex`: Sex
+
+-   `age`: Age in years
+
+-   `sib_sp`: \# of siblings / spouses aboard the Titanic
+
+-   `parch`: \# of parents / children aboard the Titanic
+
+-   `ticket`: Ticket number 
+
+-   `fare`: Passenger fare
+
+-   `cabin`: Cabin number
+
+-   `embarked`: Port of Embarkation C = Cherbourg, Q = Queenstown, S = Southampton
+
+<br>
+
+### Training and testing
+
+#### Split the dataset
+
+```{r}
+titanic_split = titanic %>% 
+  initial_split(prop = 0.85, strata = survived)
+
+titanic_train = training(titanic_split)
+titanic_test = testing(titanic_split)
+
+dim(titanic_train)
+dim(titanic_test)
+```
+
+<br>
+
+#### Missing value
+
+```{r}
+vis_miss(titanic)
+```
+
+<br>
+
+There are at least 77% observations containing missing values, which is a very large proportion. The missing values mainly appear in `age` and `cabin` variables.
+
+<br>
+
+#### Dataset balance
+
+```{r}
+titanic %>%
+  group_by(survived) %>%
+  summarise(count = n(), prop = n()/nrow(titanic))
+```
+
+<br>
+
+There is a very evident unbalance in this dataset, with 61% people not survived and 38% people survived. Thus, using `strata` = `survived` to split the dataset is very necessary, which can guarantee the model performance, especially predicting the minority class (`survived` = 1).
+
+<br>
+
+### EDA
+
+#### Gender
+
+```{r}
+titanic %>%
+  group_by(sex, survived) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  ggplot(aes(survived, count, fill = sex)) +
+  geom_bar(position = "fill", stat = "identity", width = 0.5) +
+  theme_gray()
+```
+
+<br>
+
+`sex` is a good predictor of `survived` since we can see that among people survived, female occupies a larger proportion (60%+) than male. Therefore, if an observation is female, it is more likely that she can survive.
+
+<br>
+
+#### Passenger class
+
+```{r}
+titanic %>%
+  group_by(pclass, survived) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  ggplot(aes(survived, count, fill = pclass)) +
+  geom_bar(position = "fill", stat = "identity", width = 0.5) +
+  theme_gray()
+```
+
+`pclass` is a good predictor for `survived`. Based on the plot, larger proportion of class 1 and 2 are survived, and larger proportion of class 3 are not survived.
+
+<br>
+
+It will be more useful to use percent stacked bar chart since `survived` is very unbalanced, it will be difficult to identify the relationship between `pclass` and `survived` when the bar heights are very different.
+
+#### fare
+
+```{r}
+titanic %>%
+  ggplot(aes(survived, fare, fill = survived)) +
+  geom_boxplot() +
+  theme_gray()
+```
+
+#### sibling number
+
+```{r}
+titanic %>%
+  ggplot(aes(survived, sib_sp, fill = survived)) +
+  geom_boxplot() +
+  theme_gray()
+```
+
+#### parch
+
+```{r}
+titanic %>%
+  ggplot(aes(survived, parch, fill = survived)) +
+  geom_boxplot() +
+  theme_gray()
+```
+
+<br>
+
+#### Correlation plot
+
+```{r}
+titanic %>%
+  select(where(is.numeric), -passenger_id) %>%
+  na.omit() %>%
+  cor() %>%
+  corrplot(method = "circle",
+           diag = F,
+           tl.col = "black",
+           addCoef.col = 1, 
+           number.cex = 0.7)
+```
+
+<br>
+
+1.  `parch` and `sib_sp` have a positive correlation with each other.
+
+2.  `sib_sp` and `age` have a negative correlation with each other
+
+<br>
+
+```{r}
+titanic_train %>%
+  ggplot(aes(x = fare, y = sex, fill = sex)) +
+  geom_boxplot() +
+  theme_gray()
+```
+
+
+### Create recipe
+
+```{r}
+titanic_rec = 
+  recipe(survived ~ pclass + sex + age + sib_sp + parch + fare, 
+         data = titanic_train) %>%
+  step_impute_linear(age, 
+                     impute_with = imp_vars(all_predictors())) %>%
+  step_impute_linear(fare, 
+                     impute_with = imp_vars(all_predictors())) %>%
+  step_dummy(all_nominal_predictors()) %>% 
+  step_interact(~age:fare) %>%
+  step_interact(~starts_with("sex"):fare) %>%
+  step_scale(all_predictors()) %>%
+  step_center(all_predictors())
+
+titanic_rec %>%
+  prep()
+```
+
+<br>
+
+### Model construction
+
+#### Log-regression
+
+```{r}
+log_mod = logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+
+log_wf = workflow() %>%
+  add_model(log_mod) %>%
+  add_recipe(titanic_rec)
+
+log_fit = fit(log_wf, data = titanic_train)
+```
+
+<br>
+
+#### LDA
+
+```{r}
+library(discrim)
+
+lda_mod = discrim_linear() %>%
+  set_engine("MASS") %>%
+  set_mode("classification")
+
+lda_wf = workflow() %>%
+  add_model(lda_mod) %>%
+  add_recipe(titanic_rec)
+
+lda_fit = fit(lda_wf, data = titanic_train)
+```
+
+<br>
+
+#### QDA
+
+```{r}
+qda_mod = discrim_quad() %>%
+  set_engine("MASS") %>%
+  set_mode("classification")
+
+qda_wf = workflow() %>%
+  add_model(qda_mod) %>%
+  add_recipe(titanic_rec)
+
+qda_fit = fit(qda_wf, data = titanic_train)
+```
+
+<br>
+
+#### KNN
+
+```{r}
+knn_mod = nearest_neighbor(neighbors = 10) %>%
+  set_engine("kknn") %>%
+  set_mode("classification")
+
+knn_wf = workflow() %>%
+  add_model(knn_mod) %>%
+  add_recipe(titanic_rec)
+
+knn_fit = fit(log_wf, data = titanic_train)
+```
+
+<br>
+
+#### Random Forest
+
+```{r}
+rf_mod = rand_forest(trees = 1000) %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+
+rf_wf = workflow() %>%
+  add_model(rf_mod) %>%
+  add_recipe(titanic_rec)
+
+rf_fit = fit(rf_wf, data = titanic_train)
+```
+
+#### Naive Bayes
+
+```{r}
+nb_mod = naive_Bayes() %>%
+  set_engine("klaR") %>%
+  set_mode("classification")
+
+nb_wf = workflow() %>%
+  add_model(nb_mod) %>%
+  add_recipe(titanic_rec)
+
+nb_fit = fit(nb_wf, data = titanic_train)
+```
+
+#### Neural Network
+
+```{r}
+library(brulee)
+library(AppliedPredictiveModeling)
+library(torch)
+
+nn_mod = mlp(epochs = 1000, hidden_units = 10, 
+             penalty = 0.01, learn_rate = 0.1) %>% 
+  set_engine("brulee", validation = 0) %>% 
+  set_mode("classification")
+
+nn_wf = workflow() %>%
+  add_model(nn_mod) %>%
+  add_recipe(titanic_rec)
+
+nn_fit = fit(nn_wf, data = titanic_train)
+```
+
+
+### Model evaluation using accuracy
+
+```{r, warning = False}
+# log-regression
+log_pred = predict(log_fit, new_data = titanic_train)
+log_res = bind_cols(pred = log_pred$.pred_class, 
+                    titanic_train %>% select(survived))
+
+# LDA
+lda_pred = predict(lda_fit, new_data = titanic_train)
+lda_res = bind_cols(pred = lda_pred$.pred_class, 
+                    titanic_train %>% select(survived))
+
+# QDA
+qda_pred = predict(qda_fit, new_data = titanic_train)
+qda_res = bind_cols(pred = qda_pred$.pred_class, 
+                    titanic_train %>% select(survived))
+
+# KNN
+knn_pred = predict(knn_fit, new_data = titanic_train)
+knn_res = bind_cols(pred = knn_pred$.pred_class, 
+                    titanic_train %>% select(survived))
+
+# RF
+rf_pred = predict(rf_fit, new_data = titanic_train)
+rf_res = bind_cols(pred = rf_pred$.pred_class,
+                   titanic_train %>% select(survived))
+
+# NB
+nb_res = augment(nb_fit, new_data = titanic_train)
+
+# NN
+nn_res = augment(nn_fit, new_data = titanic_train)
+```
+
+```{r}
+library(yardstick)
+
+# log-regression
+log_train_acc = log_res %>%
+  accuracy(survived, pred)
+
+# LDA
+lda_train_acc = lda_res %>%
+  accuracy(survived, pred)
+
+# QDA
+qda_train_acc = qda_res %>%
+  accuracy(survived, pred)
+
+# KNN
+knn_train_acc = knn_res %>%
+  accuracy(survived, pred)
+
+# RF
+rf_train_acc = rf_res %>%
+  accuracy(survived, pred)
+
+# NB
+nb_train_acc = nb_res %>%
+  accuracy(survived, .pred_class)
+
+# NN
+nn_train_acc = nn_res %>%
+  accuracy(survived, .pred_class)
+
+name = c("Log-regression", "LDA", "QDA", "KNN", 
+         "Random Forest", "Naive Bayes", "Neural Networks")
+train_acc = c(log_train_acc$.estimate, lda_train_acc$.estimate, qda_train_acc$.estimate, knn_train_acc$.estimate, rf_train_acc$.estimate, nb_train_acc$.estimate, nn_train_acc$.estimate)
+
+train_acc_tibble = tibble(model = name, Accuracy = train_acc) %>% arrange(-train_acc)
+train_acc_tibble
+```
+
+<br>
+
+### Fitting to testing dataset
+
+```{r, warning = False}
+# log-regression
+log_test_acc = augment(log_fit, new_data = titanic_test) %>%
+  accuracy(survived, .pred_class)
+
+# LDA
+lda_test_acc = augment(lda_fit, new_data = titanic_test) %>%
+  accuracy(survived, .pred_class)
+
+# QDA
+qda_test_acc = augment(qda_fit, new_data = titanic_test) %>%
+  accuracy(survived, .pred_class)
+
+# KNN
+knn_test_acc = augment(knn_fit, new_data = titanic_test) %>%
+  accuracy(survived, .pred_class)
+
+# RF
+rf_test_acc = augment(rf_fit, new_data = titanic_test) %>%
+  accuracy(survived, .pred_class)
+
+# NB
+nb_test_acc = augment(nb_fit, new_data = titanic_test) %>%
+  accuracy(survived, .pred_class)
+
+# NN
+nn_test_acc = augment(nn_fit, new_data = titanic_test) %>%
+  accuracy(survived, .pred_class)
+```
+
+```{r}
+name = c("Log-regression", "LDA", "QDA", "KNN", "Random Forest", "Naive Bayes", "Neural Networks")
+test_acc = c(log_test_acc$.estimate, lda_test_acc$.estimate, qda_test_acc$.estimate, knn_test_acc$.estimate, rf_test_acc$.estimate, nb_test_acc$.estimate, nn_test_acc$.estimate)
+
+acc_tibble = tibble(model = name, Accuracy = test_acc) %>% arrange(-test_acc)
+acc_tibble
+```
+
+<br>
+
+Based on our ROC tibble, Random Forest model performs best when fitting in our testing dataset. Let's draw its confusion matrix and ROC curve:
+
+<br> 
+
+```{r}
+augment(rf_fit, new_data = titanic_test) %>%
+  conf_mat(survived, .pred_class) %>%
+  autoplot(type = "heatmap")
+```
+
+```{r}
+augment(rf_fit, new_data = titanic_test) %>%
+  roc_curve(survived, .pred_No) %>%
+  autoplot()
+```
+
+### Predicting the true test dataset
+
+```{r}
+test = read_csv("test.csv", show_col_types = F)
+test_new = test %>%
+  rename(pclass = Pclass) %>%
+  rename(sex = Sex) %>%
+  rename(age = Age) %>%
+  rename(sib_sp = SibSp) %>%
+  rename(fare = Fare) %>%
+  rename(parch = Parch) %>%
+  select(-Ticket, -Cabin, -Embarked, -Name)
+
+test_new$pclass = factor(test_new$pclass)
+```
+
+```{r}
+# log-regression
+submit_log_res = augment(log_fit, new_data = test_new)
+submit_log_res$.pred_class = ifelse(submit_log_res$.pred_class == "Yes", 1, 0)
+
+final_log_res = submit_log_res %>% select(.pred_class) %>%
+  bind_cols(test_new$PassengerId) %>%
+  select(...2, .pred_class) %>% 
+  rename(PassengerId = ...2) %>%
+  rename(Survived = .pred_class)
+
+write_csv(final_log_res, "submit_result_log.csv")
+
+# KNN
+submit_knn_res = augment(knn_fit, new_data = test_new)
+submit_knn_res$.pred_class = ifelse(submit_knn_res$.pred_class == "Yes", 1, 0)
+
+final_knn_res = submit_knn_res %>% select(.pred_class) %>%
+  bind_cols(test_new$PassengerId) %>%
+  select(...2, .pred_class) %>% 
+  rename(PassengerId = ...2) %>%
+  rename(Survived = .pred_class)
+
+write_csv(final_knn_res, "submit_result_knn.csv")
+
+# LDA
+submit_lda_res = augment(lda_fit, new_data = test_new)
+submit_lda_res$.pred_class = ifelse(submit_lda_res$.pred_class == "Yes", 1, 0)
+
+final_lda_res = submit_lda_res %>% select(.pred_class) %>%
+  bind_cols(test_new$PassengerId) %>%
+  select(...2, .pred_class) %>% 
+  rename(PassengerId = ...2) %>%
+  rename(Survived = .pred_class)
+
+write_csv(final_lda_res, "submit_result_lda.csv")
+
+# QDA
+submit_qda_res = augment(qda_fit, new_data = test_new)
+submit_qda_res$.pred_class = ifelse(submit_qda_res$.pred_class == "Yes", 1, 0)
+
+final_qda_res = submit_qda_res %>% select(.pred_class) %>%
+  bind_cols(test_new$PassengerId) %>%
+  select(...2, .pred_class) %>% 
+  rename(PassengerId = ...2) %>%
+  rename(Survived = .pred_class)
+
+write_csv(final_qda_res, "submit_result_qda.csv")
+```
+
+```{r}
+final_test = titanic_rec %>%
+  prep() %>%
+  bake(new_data = test_new)
+
+glimpse(final_test)
+```
+
+
+```{r}
+# RF
+submit_rf_res = augment(rf_fit, new_data = test_new)
+submit_rf_res$.pred_class = ifelse(submit_rf_res$.pred_class == "Yes", 1, 0)
+
+final_rf_res = submit_rf_res %>% select(.pred_class) %>%
+  bind_cols(test_new$PassengerId) %>%
+  select(...2, .pred_class) %>% 
+  rename(PassengerId = ...2) %>%
+  rename(Survived = .pred_class)
+
+write_csv(final_rf_res, "submit_result_rf.csv")
+```
+
+```{r}
+# NN
+submit_nn_res = augment(nn_fit, new_data = test_new)
+submit_nn_res$.pred_class = ifelse(submit_nn_res$.pred_class == "Yes", 1, 0)
+
+final_nn_res = submit_nn_res %>% select(.pred_class) %>%
+  bind_cols(test_new$PassengerId) %>%
+  select(...2, .pred_class) %>% 
+  rename(PassengerId = ...2) %>%
+  rename(Survived = .pred_class)
+
+write_csv(final_nn_res, "submit_result_nn.csv")
+```
+
